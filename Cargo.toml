@@ -1,0 +1,27 @@
+[package]
+name = "ncp-restore"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dioxus = { version = "0.4.3", features = ["default", "hot-reload"] }
+dioxus-tui = { version = "0.4.3", features = ["default"] }
+flate2 = { version = "1.0.30", features = ["zlib-default"] }
+regex = "1.10.4"
+rustix = { version = "0.38.34", features = ["process"] }
+serde = { version = "1.0.202", features = ["serde_derive"] }
+serde_json = "1.0.117"
+tar = "0.4.40"
+users = "0.11.0"
+
+[lib]
+name = "ncp_restore"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ncp-restore-tui"
+path = "src/bin/tui.rs"
+
+[[bin]]
+name = "ncp-restore-cli"
+path = "src/bin/cli.rs"
