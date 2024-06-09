@@ -46,8 +46,6 @@ impl TarballBackupConfig {
         strip_prefix: &str,
         owner: Option<(u32, u32)>,
     ) -> Result<Option<PathBuf>, String> {
-        // TODO: Check available disk space
-        let mut tarball = Archive::new(open_tarball(&PathBuf::from(tarball_path))?);
         let nc_temporary_backup_path = to_path.with_file_name(format!(
             "{}_{}_bkp",
             match to_path.file_name() {
@@ -56,15 +54,43 @@ impl TarballBackupConfig {
             },
             Alphanumeric.sample_string(&mut rand::thread_rng(), 8)
         ));
-        if to_path.exists() {
-            if let Err(e) = fs::rename(to_path, &nc_temporary_backup_path) {
-                return Err(e.to_string());
-            }
-        } else {
+        let old_data_existing = to_path.exists();
+        if !old_data_existing {
             fs::create_dir_all(to_path).map_err(|e| e.to_string())?;
         }
         let mut io_lock = std::io::stderr().lock();
+        let mut tarball = Archive::new(open_tarball(&PathBuf::from(tarball_path))?);
+        writeln!(io_lock, "Calculating required disk space...").unwrap();
+        let required_space = tarball
+            .entries()
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| {
+                match e {
+                    Err(_) => None,
+                    Ok(e) => match e.path().ok()?.to_str()?.starts_with(filter_prefix) {
+                        true => Some(e),
+                        false => None,
+                    }
+                }
+            })
+            .map(|entry| -> u64 {
+                entry.size()
+            }).reduce(|acc,s| s + acc)
+            .unwrap_or(0);
+        let fstat = rustix::fs::statvfs(to_path).unwrap();
+        let available_space = fstat.f_bavail * fstat.f_bsize;
+        if available_space < required_space + (100*1024*1024) {
+            return Err(format!("Insufficient space for extracting backup at {:?}", to_path));
+        }
+        if old_data_existing {
+            if let Err(e) = fs::rename(to_path, &nc_temporary_backup_path) {
+                return Err(e.to_string());
+            }
+            fs::create_dir_all(to_path).map_err(|e| e.to_string())?;
+        }
+        writeln!(io_lock, "Done. Available space: {}, required space: {}, diff: {}", available_space, required_space, available_space - required_space).unwrap();
         writeln!(io_lock, "Extracting {:?} to {:?}...", &tarball_path, to_path).unwrap();
+        let mut tarball = Archive::new(open_tarball(&PathBuf::from(tarball_path))?);
         tarball
             .entries()
             .map_err(|e| e.to_string())?
