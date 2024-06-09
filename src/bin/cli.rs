@@ -2,9 +2,11 @@
 #![feature(entry_insert)]
 extern crate core;
 
+use std::path::PathBuf;
 use rustix::process::geteuid;
 use clap::{Parser, Subcommand};
 use ncp_restore::{BackupProvider, NcpConfig, RestoreConfig};
+use ncp_restore::tarball::TarballBackupConfig;
 
 
 // impl BackupProvider {
@@ -42,12 +44,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum BackupTypeCommand {
     Legacy {
-        backups_path: String,
         #[command(subcommand)]
         command: TarballCommands
     },
     Tar {
-        backups_path: String,
         #[command(subcommand)]
         command: TarballCommands
     }
@@ -55,7 +55,9 @@ enum BackupTypeCommand {
 
 #[derive(Subcommand)]
 enum TarballCommands {
-    List { },
+    List {
+        backups_path: String,
+    },
     Info {
         backup: String
     },
@@ -64,11 +66,11 @@ enum TarballCommands {
     }
 }
 
-fn handle_tarball_commands(backups_path: &str, command: &TarballCommands) -> Result<(), String> {
+fn handle_tarball_commands(command: &TarballCommands) -> Result<(), String> {
     {
-        let mut backup_provider = BackupProvider::from_tarball_backup_directory(backups_path);
         match command {
-            TarballCommands::List {} => {
+            TarballCommands::List {backups_path} => {
+                let mut backup_provider = BackupProvider::from_tarball_backup_directory(backups_path);
                 match backup_provider.scan_backups(false) {
                     Err(e) => Err(e),
                     Ok(_) => {
@@ -88,7 +90,7 @@ fn handle_tarball_commands(backups_path: &str, command: &TarballCommands) -> Res
             TarballCommands::Info {
                 backup
             } => {
-                match backup_provider.show_backup(backup, false) {
+                match TarballBackupConfig::backup_info(None, None, backup, false) {
                     Err(e) => Err(e),
                     Ok(res) => {
                         println!("Tarball Backup: {:?}", res);
@@ -99,6 +101,7 @@ fn handle_tarball_commands(backups_path: &str, command: &TarballCommands) -> Res
             TarballCommands::Restore {
                 backup
             } => {
+                let mut backup_provider = BackupProvider::from_tarball_backup_directory(PathBuf::from(backup).parent().unwrap().to_str().unwrap());
                 match backup_provider.get_restore_capabilities(backup) {
                     Err(e) => Err(e),
                     Ok(capa) => {
@@ -116,11 +119,11 @@ fn handle_tarball_commands(backups_path: &str, command: &TarballCommands) -> Res
                                 println!("Restore successful. {}{}",
                                          match ncp_backup_path {
                                              None => "".to_string(),
-                                             Some(p) => format!("Old data directory was backed up to '{:?}'. ", p)
+                                             Some(p) => format!("Old data directory was backed up to {:?}. ", p)
                                          },
                                          match nc_backup_path {
                                              None => "".to_string(),
-                                             Some(p) => format!("Old nextcloud directory was backed up to '{:?}.", p)
+                                             Some(p) => format!("Old nextcloud directory was backed up to {:?}.", p)
                                          }
                                 );
                                 Ok(())
@@ -142,8 +145,8 @@ fn main() {
 
 
     let result = match &cli.subcommand {
-        BackupTypeCommand::Legacy {command, backups_path} => handle_tarball_commands(backups_path, command),
-        BackupTypeCommand::Tar {command, backups_path} => handle_tarball_commands(backups_path, command)
+        BackupTypeCommand::Legacy {command} => handle_tarball_commands(command),
+        BackupTypeCommand::Tar {command} => handle_tarball_commands(command)
     };
 
     if let Err(e) = result {
