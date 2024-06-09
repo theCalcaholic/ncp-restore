@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use flate2::read::GzDecoder;
 use rand::distributions::{Alphanumeric, DistString};
-use regex::Regex;
+use regex::{Match, Regex};
 use tar::Archive;
 use users::get_user_by_name;
-use crate::{Backup, BackupCache, BackupInfo, BackupProviderConfig, NcpConfig, RestoreCapabilities, RestoreConfig};
-use crate::occ::{run_occ_command_blocking, set_nc_config_value};
+use crate::{Backup, BackupCache, BackupInfo, BackupProviderConfig, exec_mysql_statement, NcpConfig, RestoreCapabilities, RestoreConfig, set_db_permissions};
+use crate::occ::{get_nc_config_value, run_occ_command_blocking, set_nc_config_value};
 
 #[derive(Eq, PartialEq, Hash, Clone)]
 pub struct TarballBackupConfig {
@@ -46,6 +46,7 @@ impl TarballBackupConfig {
         strip_prefix: &str,
         owner: Option<(u32, u32)>,
     ) -> Result<Option<PathBuf>, String> {
+        // TODO: Check available disk space
         let mut tarball = Archive::new(open_tarball(&PathBuf::from(tarball_path))?);
         let nc_temporary_backup_path = to_path.with_file_name(format!(
             "{}_{}_bkp",
@@ -254,6 +255,7 @@ impl BackupProviderConfig for TarballBackupConfig {
             .join(format!("/tmp/{}", Alphanumeric.sample_string(&mut rand::thread_rng(), 8)));
         let www_data_user =
             get_user_by_name("www-data").ok_or("Could not retrieve uid of user www-data")?;
+        let mysql_password = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
         run_occ_command_blocking(
             &restore_config.target_ncp_config,
             vec!["maintenance:mode", "--on"],
@@ -281,18 +283,6 @@ impl BackupProviderConfig for TarballBackupConfig {
                     .ok_or("Failed to find redis password".to_string()),
                 Err(e) => Err(e.to_string()),
             }?;
-            let mysql_password_re = Regex::new(r"(^|\n)\s*password=(?P<pw>.*)(\n|$)").unwrap();
-            let mysql_password = match fs::read_to_string(Path::new("/root/.my.cnf")) {
-                Ok(s) => match mysql_password_re.captures(&s) {
-                    None => None,
-                    Some(caps) => match caps.name("pw") {
-                        None => None,
-                        Some(pw) => Some(pw.as_str().to_string()),
-                    },
-                }
-                    .ok_or("Failed to find mysql password".to_string()),
-                Err(e) => Err(e.to_string()),
-            }?;
             let bkp_path = self.restore_tarball_to(
                 backup_path,
                 &restore_config.target_ncp_config.nc_www_directory,
@@ -300,12 +290,45 @@ impl BackupProviderConfig for TarballBackupConfig {
                 "nextcloud/",
                 Some((www_data_user.uid(), www_data_user.primary_group_id())),
             )?;
+            // let mysql_password_re = Regex::new(r"(^|\n)\s*password=(?P<pw>.*)(\n|$)").unwrap();
+            // let mysql_password = match fs::read_to_string(Path::new("/root/.my.cnf")) {
+            //     Ok(s) => match mysql_password_re.captures(&s) {
+            //         None => None,
+            //         Some(caps) => match caps.name("pw") {
+            //             None => None,
+            //             Some(pw) => Some(pw.as_str().to_string()),
+            //         },
+            //     }
+            //         .ok_or("Failed to find mysql password".to_string()),
+            //     Err(e) => Err(e.to_string()),
+            // }?;
+            let dbname_re = Regex::new(r#"["']dbname["']\s*=>\s*["'](?P<dbname>[^"']*)["']"#).unwrap();
+            let dbpass_re = Regex::new(r#"["']dbpassword["']\s*=>\s*["'](?P<pw>[^"']*)["']"#).unwrap();
+            let (db_name, db_pass) = match fs::read_to_string(&restore_config.target_ncp_config.nc_www_directory.join("config/config.php")) {
+                Err(e) => return Err(e.to_string()),
+                Ok(s) => (match dbname_re.captures(&s) {
+                    None => None,
+                    Some(caps) => match caps.name("dbname") {
+                        None => None,
+                        Some(dbname) => Some(dbname.as_str().to_string())
+                    }
+                }.ok_or("Failed to extract dbname from nextcloud/config/config.php".to_string())?,
+                match dbpass_re.captures(&s) {
+                    None => None,
+                    Some(caps) => match caps.name("pw") {
+                        None => None,
+                        Some(pw) => Some(pw.as_str().to_string())
+                    }
+                }.ok_or("Failed to extract dbpassword from nextcloud/config/config.php".to_string())?)
+            };
+            set_db_permissions(&db_name, &db_pass, None)?;
             set_nc_config_value(
                 &restore_config.target_ncp_config,
                 vec!["dbpassword"],
                 &mysql_password,
                 true,
             )?;
+            set_db_permissions(&db_name, &mysql_password, None)?;
             set_nc_config_value(
                 &restore_config.target_ncp_config,
                 vec!["redis", "password"],
@@ -325,6 +348,7 @@ impl BackupProviderConfig for TarballBackupConfig {
 
         if restore_config.restore_db {
             eprintln!("Restoring database...");
+            let db_name = get_nc_config_value(&restore_config.target_ncp_config, vec!["dbname"], true)?;
             self.restore_tarball_to(backup_path, &unpack_dir, "nextcloud-sqlbkp_", "", None)?;
             let sql_dump_path = unpack_dir
                 .read_dir()
@@ -340,40 +364,15 @@ impl BackupProviderConfig for TarballBackupConfig {
                 .map_err(|e| e.to_string())?
                 .path();
             eprintln!("Deleting old DB...");
-            let mut sql_exec = "
+            let sql_exec = format!("
                 DROP DATABASE IF EXISTS nextcloud;
-                CREATE DATABASE nextcloud;
-                GRANT USAGE ON *.* TO '$DBADMIN'@'localhost' IDENTIFIED BY '$DBPASSWD';
-                DROP USER '$DBADMIN'@'localhost';
-                CREATE USER '$DBADMIN'@'localhost' IDENTIFIED BY '$DBPASSWD';
-                GRANT ALL PRIVILEGES ON nextcloud.* TO $DBADMIN@localhost;
-                EXIT";
+                CREATE DATABASE {db_name};");
+            match exec_mysql_statement(&sql_exec) {
+                Err(e) => Err(format!("Failed to restore db: \n  {}", e)),
+                Ok(()) => Ok(())
+            }?;
+            set_db_permissions(&db_name, &mysql_password, None)?;
             eprintln!("Importing DB backup...");
-            let mut mysql_proc = Command::new("mysql")
-                .args(vec!["-u", "root"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .map_err(|e| e.to_string())?;
-            mysql_proc
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(sql_exec.as_bytes())
-                .map_err(|e| e.to_string())?;
-            let output = mysql_proc.wait_with_output().map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                return Err(format!(
-                    "Failed to restore db: \n  {}",
-                    output
-                        .stderr
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>()
-                        .join("\n  ")
-                ));
-            }
-
             let mysql_proc = Command::new("mysql")
                 .args(vec!["-u", "root", "nextcloud"])
                 .stdin(Stdio::from(

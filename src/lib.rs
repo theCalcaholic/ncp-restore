@@ -7,11 +7,58 @@ pub mod occ;
 use std::{fs};
 use std::collections::HashMap;
 use std::fs::{File, symlink_metadata};
+use std::io::Write;
 use std::path::{PathBuf};
 use std::os::unix::fs::MetadataExt;
+use std::process::{Command, Stdio};
 use serde::Deserialize;
 use crate::occ::get_nc_config_value;
 use crate::tarball::TarballBackupConfig;
+
+const SQL_SET_NC_PERMISSIONS_TEMPLATE: &str = "
+                GRANT USAGE ON *.* TO '{dbuser}'@'localhost' IDENTIFIED BY '{dbpass}';
+                DROP USER '{dbuser}'@'localhost';
+                CREATE USER '{dbuser}'@'localhost' IDENTIFIED BY '{dbpass}';
+                GRANT ALL PRIVILEGES ON {dbname}.* TO {dbuser}@localhost;
+                EXIT";
+
+pub(crate) fn set_db_permissions(db_name: &str, db_pass: &str, db_user: Option<&str>) -> Result<(), String> {
+    let sql_exec = SQL_SET_NC_PERMISSIONS_TEMPLATE
+        .replace("{dbpass}", &db_pass)
+        .replace("{dbname}", &db_name)
+        .replace("{dbuser}", db_user.unwrap_or("ncadmin"));
+    match exec_mysql_statement(&sql_exec) {
+        Err(e) => Err(format!("Failed to set db permissions for NC: \n  {}", e)),
+        Ok(()) => Ok(())
+    }
+}
+
+pub(crate) fn exec_mysql_statement(sql_statement: &str) -> Result<(), String> {
+    let mut mysql_proc = Command::new("mysql")
+        .args(vec!["-u", "root"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    mysql_proc
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(sql_statement.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let output = mysql_proc.wait_with_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(
+            output
+                .stderr
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+                .join("\n  ")
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct NcpCfgJsonModel {
