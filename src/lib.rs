@@ -3,15 +3,18 @@
 
 pub mod tarball;
 pub mod occ;
+pub mod kopia;
 
 use std::{fs};
 use std::collections::HashMap;
 use std::fs::{File, symlink_metadata};
 use std::io::Write;
-use std::path::{PathBuf};
+use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use clap::builder::Str;
 use serde::Deserialize;
+use crate::kopia::KopiaConfig;
 use crate::occ::get_nc_config_value;
 use crate::tarball::TarballBackupConfig;
 
@@ -58,6 +61,29 @@ pub(crate) fn exec_mysql_statement(sql_statement: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn system_mv(from: &Path, to: &Path) -> Result<Output, String> {
+    let mut cmd = &mut Command::new("cp");
+    cmd = cmd
+        .arg(from.to_str().ok_or(format!("Failed to parse path {:?}", from))?)
+        .arg(to.to_str().ok_or(format!("Failed to parse path {:?}", from))?);
+
+    cmd.output().map_err(|e| e.to_string())
+}
+pub(crate) fn system_cp(from: &Path, to: &Path, recursive: bool) -> Result<Output, String> {
+    if from.is_dir() && !recursive {
+        return Err(format!("Cannot move {:?} - is a directory (and recursive is `false`)", from))
+    }
+    let mut cmd = &mut Command::new("cp");
+    if recursive {
+        cmd = cmd.arg("-R");
+    }
+    cmd = cmd
+        .arg(from.to_str().ok_or(format!("Failed to parse path {:?}", from))?)
+        .arg(to.to_str().ok_or(format!("Failed to parse path {:?}", from))?);
+
+    cmd.output().map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,13 +216,13 @@ impl NcpConfig {
 
 #[derive(Debug)]
 pub struct RestoreConfig {
-    pub source_ncp_config: Option<NcpConfig>,
-    pub target_ncp_config: NcpConfig,
     pub restore_nextcloud: bool,
     pub restore_db: bool,
     pub restore_files: bool,
     pub restore_ncp_config: bool,
 }
+
+type BackupConfig = RestoreConfig;
 
 impl RestoreConfig {
     fn from_backup(
@@ -214,9 +240,6 @@ impl RestoreConfig {
             restore_files: capabilities.files,
             restore_ncp_config: capabilities.ncp_config,
             restore_nextcloud: capabilities.nextcloud,
-            source_ncp_config: None,
-            target_ncp_config: NcpConfig::detect_system_config(true)
-                .unwrap_or(NcpConfig::default()),
         })
     }
 }
@@ -227,7 +250,9 @@ pub trait BackupProviderConfig {
 
     fn get_ncp_system_config(&self, backup: &str) -> Option<NcpConfig>;
 
-    fn restore(&self, backup: &str, restore_config: RestoreConfig) -> Result<(Option<PathBuf>, Option<PathBuf>), String>;
+    fn create(&self, backup: &str, backup_config: BackupConfig, source_config: NcpConfig) -> Result<(), String>;
+
+    fn restore(&self, backup: &str, restore_config: RestoreConfig, target_config: NcpConfig) -> Result<(Option<PathBuf>, Option<PathBuf>), String>;
 
     fn scan_backups(&self, cache: &mut BackupCache, rescan: bool) -> Result<(), String>;
 
@@ -245,29 +270,18 @@ pub struct RestoreCapabilities {
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
-struct KopiaConfig {}
-
-// impl BackupProvider for KopiaConfig {
-//     fn can_restore(&self, backup_id: String) -> bool {
-//
-//     }
-//     fn validate_config(&self) -> bool {
-//
-//     }
-// }
-
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
 struct BtrfsSnapshotConfig {}
 
 pub enum BackupProvider {
     Tarball(TarballBackupConfig, BackupCache),
+    Kopia(KopiaConfig, BackupCache)
 }
 
 impl BackupProvider {
     pub fn from_tarball_backup_directory(backups_path: &str) -> BackupProvider {
         BackupProvider::Tarball(
             TarballBackupConfig {
-                path: Some(PathBuf::from(backups_path)),
+                path: PathBuf::from(backups_path),
             },
             BackupCache::new(),
         )
@@ -276,24 +290,30 @@ impl BackupProvider {
     pub fn validate(&self) -> bool {
         match self {
             BackupProvider::Tarball(cfg, _) => cfg.validate(),
+            BackupProvider::Kopia(cfg, _) => todo!("Not implemented")
         }
     }
 
     pub fn get_restore_capabilities(&self, backup: &str) -> Result<RestoreCapabilities, String> {
         match self {
             BackupProvider::Tarball(cfg, _) => cfg.get_restore_capabilities(backup),
+            BackupProvider::Kopia(cfg, _) => todo!("Not implemented")
         }
     }
 
     pub fn restore(&self, backup: &str, restore_config: RestoreConfig) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+        let target_config = NcpConfig::detect_system_config(true)
+            .unwrap_or(NcpConfig::default());
         match self {
-            BackupProvider::Tarball(cfg, _) => cfg.restore(backup, restore_config),
+            BackupProvider::Tarball(cfg, _) => cfg.restore(backup, restore_config, target_config),
+            BackupProvider::Kopia(cfg, _) => todo!("Not implemented")
         }
     }
 
     pub fn scan_backups(&mut self, rescan: bool) -> Result<(), String> {
         match self {
             BackupProvider::Tarball(cfg, cache) => cfg.scan_backups(cache, rescan),
+            BackupProvider::Kopia(cfg, _) => todo!("Not implemented")
         }
     }
 
@@ -302,12 +322,14 @@ impl BackupProvider {
             BackupProvider::Tarball(cfg, cache) => {
                 cfg.backup_info(cache, backup, rescan)
             }
+            BackupProvider::Kopia(cfg, _) => todo!("Not implemented")
         }
     }
 
     pub fn list_backups(&self) -> Vec<BackupInfo> {
         match self {
             BackupProvider::Tarball(cfg, cache) => cfg.list_backups(cache),
+            BackupProvider::Kopia(cfg, _) => todo!("Not implemented")
         }
     }
 }

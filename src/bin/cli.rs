@@ -106,8 +106,6 @@ fn handle_tarball_commands(command: &TarballCommands) -> Result<(), String> {
                     Err(e) => Err(e),
                     Ok(capa) => {
                         let config = RestoreConfig {
-                            target_ncp_config: NcpConfig::detect_system_config(false).unwrap(),
-                            source_ncp_config: None,
                             restore_files: capa.files,
                             restore_db: capa.db,
                             restore_nextcloud: capa.nextcloud,

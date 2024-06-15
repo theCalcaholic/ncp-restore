@@ -6,15 +6,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use flate2::read::GzDecoder;
 use rand::distributions::{Alphanumeric, DistString};
-use regex::{Match, Regex};
+use regex::{Regex};
 use tar::Archive;
 use users::get_user_by_name;
-use crate::{Backup, BackupCache, BackupInfo, BackupProviderConfig, exec_mysql_statement, NcpConfig, RestoreCapabilities, RestoreConfig, set_db_permissions};
+use crate::{Backup, BackupCache, BackupConfig, BackupInfo, BackupProviderConfig, exec_mysql_statement, NcpConfig, RestoreCapabilities, RestoreConfig, set_db_permissions};
 use crate::occ::{get_nc_config_value, run_occ_command_blocking, set_nc_config_value};
 
 #[derive(Eq, PartialEq, Hash, Clone)]
 pub struct TarballBackupConfig {
-    pub(crate) path: Option<PathBuf>,
+    pub(crate) path: PathBuf,
 }
 
 impl fmt::Debug for TarballBackupConfig {
@@ -199,10 +199,18 @@ impl TarballBackupConfig {
     }
 
     pub fn backup_info(backup_config: Option<&TarballBackupConfig>, cache: Option<&mut BackupCache>, backup: &str, rescan: bool) -> Result<BackupInfo, String> {
-        let index = Backup::Legacy(match backup_config {
-            Some(cfg) => cfg.clone(),
-            None => TarballBackupConfig{path: None}
-        }, backup.to_string());
+        let index = Backup::Legacy(
+            match backup_config {
+                Some(cfg) => cfg.clone(),
+                
+                None => TarballBackupConfig{
+                    path: PathBuf::from(backup).parent()
+                        .ok_or(format!("could not get parent directory for \"{}\"", backup))?
+                        .to_path_buf()
+                }
+            }, 
+            backup.to_string()
+        );
         let capas = match cache {
             Some(cache) => if ! cache.contains_key(&index) || rescan {
                 let val = match TarballBackupConfig::get_restore_capabilities(backup) {
@@ -271,10 +279,13 @@ impl BackupProviderConfig for TarballBackupConfig {
     //     todo!("Not yet implemented");
     // }
 
+    fn create(&self, backup: &str, backup_config: BackupConfig, source_config: NcpConfig) -> Result<(), String> {
+        todo!()
+    }
+
     // todo refactor to use some sort of restore process multistep engine
-    fn restore(&self, backup_path: &str, restore_config: RestoreConfig) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
-        let unpack_dir = restore_config
-            .target_ncp_config
+    fn restore(&self, backup_path: &str, restore_config: RestoreConfig, target_config: NcpConfig) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+        let unpack_dir = &target_config
             .ncp_data_volume
             .parent()
             .unwrap_or(Path::new("/tmp"))
@@ -283,12 +294,12 @@ impl BackupProviderConfig for TarballBackupConfig {
             get_user_by_name("www-data").ok_or("Could not retrieve uid of user www-data")?;
         let mysql_password = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
         run_occ_command_blocking(
-            &restore_config.target_ncp_config,
+            &target_config,
             vec!["maintenance:mode", "--on"],
         )?;
 
         let nc_bkp_path = if restore_config.restore_nextcloud {
-            eprintln!("Restoring nextcloud directory ({:?})...", &restore_config.target_ncp_config.nc_www_directory);
+            eprintln!("Restoring nextcloud directory ({:?})...", &target_config.nc_www_directory);
             let redis_pw_re = Regex::new(r"(^|\n)\s*requirepass\s+(?P<pw>.*)\s*(\n|$)").unwrap();
             let redis_password = match fs::read_to_string(Path::new("/etc/redis/redis.conf")) {
                 Ok(s) => {
@@ -311,7 +322,7 @@ impl BackupProviderConfig for TarballBackupConfig {
             }?;
             let bkp_path = self.restore_tarball_to(
                 backup_path,
-                &restore_config.target_ncp_config.nc_www_directory,
+                &target_config.nc_www_directory,
                 "nextcloud/",
                 "nextcloud/",
                 Some((www_data_user.uid(), www_data_user.primary_group_id())),
@@ -330,7 +341,7 @@ impl BackupProviderConfig for TarballBackupConfig {
             // }?;
             let dbname_re = Regex::new(r#"["']dbname["']\s*=>\s*["'](?P<dbname>[^"']*)["']"#).unwrap();
             let dbpass_re = Regex::new(r#"["']dbpassword["']\s*=>\s*["'](?P<pw>[^"']*)["']"#).unwrap();
-            let (db_name, db_pass) = match fs::read_to_string(&restore_config.target_ncp_config.nc_www_directory.join("config/config.php")) {
+            let (db_name, db_pass) = match fs::read_to_string(&target_config.nc_www_directory.join("config/config.php")) {
                 Err(e) => return Err(e.to_string()),
                 Ok(s) => (match dbname_re.captures(&s) {
                     None => None,
@@ -349,22 +360,22 @@ impl BackupProviderConfig for TarballBackupConfig {
             };
             set_db_permissions(&db_name, &db_pass, None)?;
             set_nc_config_value(
-                &restore_config.target_ncp_config,
+                &target_config,
                 vec!["dbpassword"],
                 &mysql_password,
                 true,
             )?;
             set_db_permissions(&db_name, &mysql_password, None)?;
             set_nc_config_value(
-                &restore_config.target_ncp_config,
+                &target_config,
                 vec!["redis", "password"],
                 &redis_password,
                 true,
             )?;
-            let data_dir = &restore_config.target_ncp_config.nc_data_directory;
+            let data_dir = &target_config.nc_data_directory;
             let data_dir_str = data_dir.to_str()
                 .ok_or(format!("Failed to parse data directory {:?}", data_dir))?;
-            set_nc_config_value(&restore_config.target_ncp_config,
+            set_nc_config_value(&target_config,
                                 vec!["datadirectory"], data_dir_str, true)?;
             eprintln!("Success.");
             bkp_path
@@ -374,7 +385,7 @@ impl BackupProviderConfig for TarballBackupConfig {
 
         if restore_config.restore_db {
             eprintln!("Restoring database...");
-            let db_name = get_nc_config_value(&restore_config.target_ncp_config, vec!["dbname"], true)?;
+            let db_name = get_nc_config_value(&target_config, vec!["dbname"], true)?;
             self.restore_tarball_to(backup_path, &unpack_dir, "nextcloud-sqlbkp_", "", None)?;
             let sql_dump_path = unpack_dir
                 .read_dir()
@@ -424,8 +435,8 @@ impl BackupProviderConfig for TarballBackupConfig {
         }
 
         let ncp_data_bkp = if restore_config.restore_files {
-            eprintln!("Restoring data directory ({:?})...", &restore_config.target_ncp_config.nc_data_directory);
-            let ncp_data_volume_path = restore_config.target_ncp_config.ncp_data_volume.clone();
+            eprintln!("Restoring data directory ({:?})...", &target_config.nc_data_directory);
+            let ncp_data_volume_path = target_config.ncp_data_volume.clone();
             let ncp_data_bkp = if ncp_data_volume_path.exists() {
                 let bkp_file_name = match ncp_data_volume_path.file_name() {
                     None => None,
@@ -443,7 +454,7 @@ impl BackupProviderConfig for TarballBackupConfig {
             };
             self.restore_tarball_to(
                 backup_path,
-                &restore_config.target_ncp_config.nc_data_directory,
+                &target_config.nc_data_directory,
                 "data",
                 "data",
                 Some((www_data_user.uid(), www_data_user.primary_group_id())),
@@ -456,14 +467,14 @@ impl BackupProviderConfig for TarballBackupConfig {
         if restore_config.restore_files {
             eprintln!("Scanning files...");
             run_occ_command_blocking(
-                &restore_config.target_ncp_config,
+                &target_config,
                 vec!["files:scan", "--all"],
             )?;
             eprintln!("done.")
         }
 
         run_occ_command_blocking(
-            &restore_config.target_ncp_config,
+            &target_config,
             vec!["maintenance:mode", "--off"],
         )?;
 
@@ -482,11 +493,7 @@ impl BackupProviderConfig for TarballBackupConfig {
     }
 
     fn scan_backups(&self, cache: &mut BackupCache, rescan: bool) -> Result<(), String> {
-        let bkps_path = match &self.path {
-            None => return Err("Backups path is not set".to_string()),
-            Some(p) => p
-        };
-        let files = fs::read_dir(bkps_path).map_err(|e| e.to_string())?;
+        let files = fs::read_dir(&self.path).map_err(|e| e.to_string())?;
         for backup in files.flatten() {
             if let Some(bkp_str) = backup.path().to_str() {
                 let index = Backup::Legacy(self.clone(), bkp_str.to_string());
